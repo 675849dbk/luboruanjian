@@ -10,6 +10,24 @@ import contextlib
 import hashlib
 import ctypes
 import tempfile
+import subprocess
+import datetime
+import traceback
+
+LOG_FILE = os.path.join(os.environ.get('TEMP', tempfile.gettempdir()), 'video_connect.log')
+
+
+def _log(msg):
+    try:
+        with open(LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write('{} {}\n'.format(datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3], msg))
+            f.flush()
+    except Exception:
+        pass
+
+
+def _log_exc():
+    _log(traceback.format_exc())
 
 os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = ''
 os.environ['OPENCV_LOG_LEVEL'] = 'ERROR'
@@ -20,13 +38,10 @@ import PyQt5
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QComboBox, QFrame,
-    QSizePolicy, QMessageBox, QStackedWidget, QGraphicsBlurEffect,
-    QDialog, QLineEdit,
+    QSizePolicy, QMessageBox, QGraphicsBlurEffect, QDialog, QLineEdit,
 )
-from PyQt5.QtCore import Qt, QTimer, QEvent, QUrl
+from PyQt5.QtCore import Qt, QTimer, QEvent
 from PyQt5.QtGui import QImage, QPixmap, QFont, QPainter, QColor, QBrush
-from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
-from PyQt5.QtMultimediaWidgets import QVideoWidget
 
 IS_WINDOWS = platform.system() == 'Windows'
 CAMERA_BACKEND = cv2.CAP_DSHOW if IS_WINDOWS else cv2.CAP_ANY
@@ -41,23 +56,21 @@ DEFAULT_OVERLAY_SIZE = '中 (320x240)'
 
 
 # ==================== 授权 & 单实例 ====================
-AUTH_CODE = '15679792589'
+AUTH_CODE = '19272442589'
 LICENSE_DIR = os.path.join(os.environ.get('APPDATA', tempfile.gettempdir()), 'VideoConnect')
 LICENSE_FILE = os.path.join(LICENSE_DIR, '.license')
 MUTEX_NAME = 'Global\\VideoConnectApp_SingleInstance'
 
 
 def check_single_instance():
-    """Windows 命名互斥体：确保同一时间只有一个实例运行"""
     kernel32 = ctypes.windll.kernel32
     handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
-    if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+    if kernel32.GetLastError() == 183:
         return False
     return True
 
 
 def clear_license():
-    """清除授权文件"""
     try:
         if os.path.exists(LICENSE_FILE):
             os.remove(LICENSE_FILE)
@@ -66,59 +79,69 @@ def clear_license():
 
 
 def get_machine_id():
-    """
-    生成机器指纹：仅绑定磁盘序列号。
-    原理：通过 wmic 读取系统盘物理序列号做 SHA256，
-    只要不更换硬盘，重装系统后指纹不变。
-    """
-    try:
-        import subprocess
-        out = subprocess.check_output(
-            'wmic diskdrive get serialnumber', shell=True,
-            stderr=subprocess.DEVNULL
-        ).decode('utf-8', errors='ignore')
-        for line in out.splitlines():
-            s = line.strip()
-            if s and s.lower() != 'serialnumber':
-                return hashlib.sha256(s.encode()).hexdigest()
-    except Exception:
-        pass
-    return hashlib.sha256(platform.node().encode()).hexdigest()
+    commands = [
+        (['powershell', '-NoProfile', '-Command',
+          'Get-CimInstance Win32_DiskDrive | Select-Object -ExpandProperty SerialNumber'],
+         'PowerShell'),
+        ('wmic diskdrive get serialnumber', 'wmic'),
+    ]
+    for cmd, name in commands:
+        try:
+            _log('get_machine_id: 尝试 {}'.format(name))
+            shell = isinstance(cmd, str)
+            out = subprocess.check_output(
+                cmd, shell=shell, stderr=subprocess.DEVNULL, timeout=10
+            ).decode('utf-8', errors='ignore')
+            for line in out.splitlines():
+                s = line.strip()
+                if s and s.lower() not in ('serialnumber', ''):
+                    result = hashlib.sha256(s.encode()).hexdigest()
+                    _log('get_machine_id: {} 成功'.format(name))
+                    return result
+        except Exception:
+            _log('get_machine_id: {} 失败'.format(name))
+            _log_exc()
+    fallback = hashlib.sha256(platform.node().encode()).hexdigest()
+    _log('get_machine_id: 使用 fallback')
+    return fallback
 
 
 def make_license_hash(machine_id, auth_code):
-    """license 文件内容：sha256(machine_id + auth_code)"""
     return hashlib.sha256((machine_id + auth_code).encode()).hexdigest()
 
 
 def verify_license():
-    """返回 True 表示已授权，False 需弹出授权对话框"""
     if not os.path.exists(LICENSE_FILE):
         return False
     try:
         with open(LICENSE_FILE, 'r') as f:
             stored = f.read().strip()
-        expected = make_license_hash(get_machine_id(), AUTH_CODE)
-        return stored == expected
+        return stored == make_license_hash(get_machine_id(), AUTH_CODE)
     except Exception:
         return False
 
 
 def save_license():
-    """保存授权文件"""
     os.makedirs(LICENSE_DIR, exist_ok=True)
-    h = make_license_hash(get_machine_id(), AUTH_CODE)
-    with open(LICENSE_FILE, 'w') as f:
+    mid = get_machine_id()
+    h = make_license_hash(mid, AUTH_CODE)
+    tmp = LICENSE_FILE + '.tmp'
+    with open(tmp, 'w') as f:
         f.write(h)
-    # 隐藏文件
     try:
-        ctypes.windll.kernel32.SetFileAttributesW(LICENSE_FILE, 2)  # FILE_ATTRIBUTE_HIDDEN
-    except Exception:
-        pass
+        os.replace(tmp, LICENSE_FILE)
+    except PermissionError:
+        try:
+            if IS_WINDOWS:
+                ctypes.windll.kernel32.SetFileAttributesW(LICENSE_FILE, 0x80)
+            os.remove(LICENSE_FILE)
+            os.replace(tmp, LICENSE_FILE)
+        except Exception:
+            os.remove(tmp)
+            raise
 
 
 class AuthDialog(QDialog):
-    """授权码输入对话框"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -140,9 +163,7 @@ class AuthDialog(QDialog):
 
         title = QLabel('软件授权验证')
         title.setAlignment(Qt.AlignCenter)
-        title.setStyleSheet(
-            'font-size: 38px; font-weight: 800; color: #1e293b; letter-spacing: 6px;'
-        )
+        title.setStyleSheet('font-size: 38px; font-weight: 800; color: #1e293b; letter-spacing: 6px;')
         layout.addWidget(title)
 
         hint = QLabel('请输入授权码以继续使用')
@@ -157,8 +178,7 @@ class AuthDialog(QDialog):
             QLineEdit {
                 border: 2px solid #e2e8f0; border-radius: 10px;
                 padding: 14px 20px; font-size: 50px;
-                background-color: #f8fafc; color: #1e293b;
-                letter-spacing: 4px;
+                background-color: #f8fafc; color: #1e293b; letter-spacing: 4px;
             }
             QLineEdit:focus { border-color: #3b82f6; background-color: #ffffff; }
         """)
@@ -190,26 +210,49 @@ class AuthDialog(QDialog):
         self._input.setFocus()
 
     def _check(self):
-        code = self._input.text().strip()
-        if code == AUTH_CODE:
-            save_license()
-            self.accept()
-        else:
-            self._msg.setText('授权码错误，请重试')
+        if getattr(self, '_checking', False):
+            return
+        self._checking = True
+        try:
+            code = self._input.text().strip()
+            _log('AuthDialog._check 开始')
+            if code == AUTH_CODE:
+                try:
+                    save_license()
+                    _log('save_license 完成, 准备 accept')
+                except Exception:
+                    _log_exc()
+                    self._msg.setText('保存授权失败，请重试')
+                    self._msg.setStyleSheet('color: #ef4444; font-size: 18px;')
+                    self._input.clear()
+                    self._input.setFocus()
+                    self._checking = False
+                    return
+                _log('AuthDialog._check 调用 done()')
+                QTimer.singleShot(0, lambda: self.done(QDialog.Accepted))
+            else:
+                self._msg.setText('授权码错误，请重试')
+                self._msg.setStyleSheet('color: #ef4444; font-size: 18px;')
+                self._input.clear()
+                self._input.setFocus()
+                self._checking = False
+        except Exception:
+            _log_exc()
+            self._checking = False
+            self._msg.setText('验证过程出错，请重试')
             self._msg.setStyleSheet('color: #ef4444; font-size: 18px;')
-            self._input.clear()
-            self._input.setFocus()
 
 
 @contextlib.contextmanager
 def _suppress_stderr():
+    _stderr = sys.stderr
+    _devnull = open(os.devnull, 'w')
+    sys.stderr = _devnull
     try:
-        _stderr = sys.stderr
-        sys.stderr = open(os.devnull, 'w')
         yield
     finally:
-        sys.stderr.close()
         sys.stderr = _stderr
+        _devnull.close()
 
 
 # ==================== 摄像头检测 ====================
@@ -219,16 +262,22 @@ class CameraDetector:
     def get_available_cameras():
         cameras = []
         for idx in range(8):
-            with _suppress_stderr():
-                cap = cv2.VideoCapture(idx, CAMERA_BACKEND)
-                ok = cap.isOpened()
-                if ok:
-                    ret, _ = cap.read()
-                    if ret:
-                        cameras.append(idx)
-                cap.release()
-            if not ok:
-                cap.release()
+            cap = None
+            try:
+                with _suppress_stderr():
+                    cap = cv2.VideoCapture(idx, CAMERA_BACKEND)
+                    if cap.isOpened():
+                        ret, _ = cap.read()
+                        if ret:
+                            cameras.append(idx)
+            except Exception:
+                pass
+            finally:
+                if cap is not None:
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
         return cameras
 
     @staticmethod
@@ -247,9 +296,7 @@ class CameraOverlay(QFrame):
         self._cap = None
         self._paused = False
 
-        self.setWindowFlags(
-            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
-        )
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setMinimumSize(120, 90)
@@ -264,13 +311,7 @@ class CameraOverlay(QFrame):
 
     def _setup_ui(self):
         self.setObjectName('cameraOverlay')
-        self.setStyleSheet("""
-            #cameraOverlay {
-                background-color: transparent;
-                border: none;
-                border-radius: 0px;
-            }
-        """)
+        self.setStyleSheet('#cameraOverlay { background-color: transparent; border: none; }')
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(0)
@@ -372,7 +413,81 @@ class CameraOverlay(QFrame):
         super().closeEvent(e)
 
 
-# ==================== 全屏播放器 ====================
+def _find_ffplay_exe():
+    if getattr(sys, 'frozen', False):
+        bundled = os.path.join(sys._MEIPASS, 'ffplay.exe')
+        if os.path.isfile(bundled):
+            return bundled
+    local = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ffplay.exe')
+    if os.path.isfile(local):
+        return local
+    return 'ffplay'
+
+
+# ==================== 全屏播放器（ffplay 统一音视频） ====================
+class _FfplayEngine:
+
+    def __init__(self, file_path):
+        self._file_path = file_path
+        self._proc = None
+
+    def play(self, start_sec=0.0):
+        self.stop()
+        try:
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            self._proc = subprocess.Popen(
+                [_find_ffplay_exe(), '-fs', '-noborder', '-loglevel', 'quiet',
+                 '-ss', '{:.3f}'.format(start_sec), '-loop', '0',
+                 self._file_path],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                startupinfo=si,
+            )
+        except Exception:
+            self._proc = None
+
+    def stop(self):
+        if self._proc:
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=2)
+            except Exception:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+            self._proc = None
+
+    def find_window(self):
+        if not self.running:
+            return None
+        pid = self._proc.pid
+        hwnd = ctypes.windll.user32.FindWindowW('SDL_app', None)
+        if hwnd:
+            proc_id = ctypes.c_ulong()
+            ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(proc_id))
+            if proc_id.value == pid:
+                return hwnd
+        result = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_ulonglong, ctypes.c_ulonglong)
+        def enum_callback(hwnd, _lparam):
+            proc_id = ctypes.c_ulong()
+            ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(proc_id))
+            if proc_id.value == pid and ctypes.windll.user32.IsWindowVisible(hwnd):
+                result.append(hwnd)
+            return True
+
+        ctypes.windll.user32.EnumWindows(enum_callback, 0)
+        return result[0] if result else None
+
+    @property
+    def running(self):
+        return self._proc is not None and self._proc.poll() is None
+
+
 class FullScreenPlayer(QMainWindow):
 
     def __init__(self, video_path, camera_index=0, overlay_size=(320, 240),
@@ -382,39 +497,34 @@ class FullScreenPlayer(QMainWindow):
         self._camera_index = camera_index
         self._on_close = on_close
         self._overlay_size = overlay_size
-        self._camera_overlay = None
-        self._use_opencv = False
-        self._cap = None
-        self._video_timer = None
-        self._fps = 30.0
-        self._total_frames = 0
         self._paused = False
-        self._init_done = False
+        self._toggle_guard = False
+        self._space_passthrough = False
 
         self.setWindowTitle('视频连线')
-        self._setup_ui()
-        self._try_play()
-
-    def _setup_ui(self):
-        self.setStyleSheet('background-color: #000000;')
-        self._stack = QStackedWidget()
-        self.setCentralWidget(self._stack)
-
-        self._video_widget = QVideoWidget()
-        self._video_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self._stack.addWidget(self._video_widget)
-
-        self._video_label = QLabel()
-        self._video_label.setAlignment(Qt.AlignCenter)
-        self._video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self._stack.addWidget(self._video_label)
-
-        # ---------- 暂停模糊遮罩 ----------
-        self._pause_overlay = QWidget(self)
-        self._pause_overlay.setObjectName('pauseOverlay')
-        self._pause_overlay.setStyleSheet(
-            '#pauseOverlay { background-color: rgba(0,0,0,100); }'
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setStyleSheet('background: transparent;')
+        self.setWindowFlags(
+            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
         )
+
+        central = QWidget()
+        central.setStyleSheet('background: transparent;')
+        central.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setCentralWidget(central)
+
+        self._ffplay = _FfplayEngine(video_path)
+        self._camera_overlay = CameraOverlay(camera_index, overlay_size)
+
+        # 暂停遮罩
+        self._pause_overlay = QWidget()
+        self._pause_overlay.setWindowFlags(
+            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+        )
+        self._pause_overlay.setAttribute(Qt.WA_TranslucentBackground, False)
+        self._pause_overlay.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self._pause_overlay.setFocusPolicy(Qt.NoFocus)
+        self._pause_overlay.setStyleSheet('background-color: rgba(0,0,0,120);')
         self._pause_overlay.hide()
 
         self._pause_bg = QLabel(self._pause_overlay)
@@ -428,8 +538,7 @@ class FullScreenPlayer(QMainWindow):
         self._pause_text = QLabel('加载中...', self._pause_overlay)
         self._pause_text.setAlignment(Qt.AlignCenter)
         self._pause_text.setStyleSheet(
-            'color: #cccccc; font-size: 18px; font-weight: 600;'
-            'background: transparent;'
+            'color: #cccccc; font-size: 18px; font-weight: 600; background: transparent;'
         )
 
         self._spinner_angle = 0
@@ -437,135 +546,63 @@ class FullScreenPlayer(QMainWindow):
         self._spinner_timer.timeout.connect(self._spin)
         self._spinner_timer.setInterval(40)
 
-    # ========== 播放引擎 ==========
-    def _try_play(self):
-        self._player = QMediaPlayer(self)
-        self._player.setVideoOutput(self._video_widget)
-        self._player.setMedia(QMediaContent(QUrl.fromLocalFile(self._video_path)))
-        self._player.error.connect(self._on_qt_error)
-        self._player.mediaStatusChanged.connect(self._on_media_status)
-        self._player.play()
-
-        self._fallback_timer = QTimer(self)
-        self._fallback_timer.setSingleShot(True)
-        self._fallback_timer.timeout.connect(self._try_opencv_fallback)
-        self._fallback_timer.start(800)
-
-    def _on_media_status(self, status):
-        if status in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia,
-                       QMediaPlayer.BufferingMedia):
-            try:
-                self._fallback_timer.stop()
-            except Exception:
-                pass
-            if not self._init_done:
-                self._init_done = True
-                self._camera_overlay = CameraOverlay(
-                    self._camera_index, self._overlay_size
-                )
-                self.showFullScreen()
-                self._camera_overlay.show()
-        elif status == QMediaPlayer.EndOfMedia:
-            self._player.setPosition(0)
-            self._player.play()
-
-    def _on_qt_error(self, error):
-        try:
-            self._fallback_timer.stop()
-        except Exception:
-            pass
-        self._fallback_timer.deleteLater()
-        self._switch_to_opencv()
-
-    def _try_opencv_fallback(self):
-        if self._player.state() == QMediaPlayer.StoppedState:
-            self._switch_to_opencv()
-
-    def _switch_to_opencv(self):
-        self._use_opencv = True
-        try:
-            self._player.stop()
-        except Exception:
-            pass
-
-        self._cap = cv2.VideoCapture(self._video_path)
-        if not self._cap.isOpened():
-            QMessageBox.critical(self, '无法播放',
-                                 '无法打开：\n{}'.format(self._video_path))
-            self.close()
-            return
-
-        self._fps = self._cap.get(cv2.CAP_PROP_FPS)
-        if self._fps <= 0 or self._fps > 120:
-            self._fps = 30.0
-        self._total_frames = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        self._stack.setCurrentWidget(self._video_label)
-
-        frame_delay = max(10, int(1000.0 / self._fps))
-        self._video_timer = QTimer(self)
-        self._video_timer.timeout.connect(self._update_opencv_frame)
-        self._video_timer.start(frame_delay)
-
-        self._camera_overlay = CameraOverlay(self._camera_index, self._overlay_size)
+        # 全屏并启动
         self.showFullScreen()
         self._camera_overlay.show()
+        self._ffplay.play()
 
-    def _update_opencv_frame(self):
-        if not self._use_opencv or self._paused:
-            return
-        if self._cap is None or not self._cap.isOpened():
-            return
-        ret, frame = self._cap.read()
-        if not ret:
-            self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ret, frame = self._cap.read()
-            if not ret:
-                return
-        try:
-            lw = self._video_label.width()
-            lh = self._video_label.height()
-            if lw <= 0 or lh <= 0:
-                return
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame = cv2.resize(frame, (lw, lh), interpolation=cv2.INTER_LINEAR)
-            frame = np.ascontiguousarray(frame)
-            h, w, ch = frame.shape
-            qi = QImage(frame.data, w, h, w * ch, QImage.Format_RGB888).copy()
-            self._video_label.setPixmap(QPixmap.fromImage(qi))
-        except Exception:
-            pass
+        # 安装原生事件过滤器（不依赖焦点捕获按键）
+        self._hooked = False
+        if IS_WINDOWS:
+            self._install_hook()
 
-    # ========== 控制 ==========
+    # ========== 暂停 / 恢复 ==========
     def _toggle_pause(self):
-        was_paused = self._is_currently_paused()
-        should_pause = not was_paused
-
-        if self._use_opencv:
-            self._paused = should_pause
-        else:
-            if should_pause:
-                self._player.pause()
-            else:
-                self._player.play()
-
-        if should_pause:
+        self._paused = not self._paused
+        if self._paused:
+            self._send_ffplay_space()
             self._show_pause_overlay()
             if self._camera_overlay is not None:
                 self._camera_overlay.set_paused(True)
+            QTimer.singleShot(400, self._reenable_toggle)
         else:
+            self._send_ffplay_space()
             self._hide_pause_overlay()
             if self._camera_overlay is not None:
                 self._camera_overlay.set_paused(False)
+            QTimer.singleShot(600, self._reenable_toggle)
 
-    def _is_currently_paused(self):
-        if self._use_opencv:
-            return self._paused
-        return self._player.state() != QMediaPlayer.PlayingState
+    def _send_ffplay_space(self):
+        if not self._ffplay.running:
+            return
+        self._space_passthrough = True
+        hwnd = self._ffplay.find_window()
+        if hwnd:
+            WM_KEYDOWN = 0x0100
+            WM_KEYUP = 0x0101
+            VK_SPACE = 0x20
+            SC_SPACE = 0x39
+            lparam_down = (SC_SPACE << 16) | 1
+            lparam_up = (SC_SPACE << 16) | (1 << 31) | (1 << 30) | 1
+            ctypes.windll.user32.SendMessageW(hwnd, WM_KEYDOWN, VK_SPACE, lparam_down)
+            ctypes.windll.user32.SendMessageW(hwnd, WM_KEYUP, VK_SPACE, lparam_up)
+        else:
+            ctypes.windll.user32.keybd_event(0x20, 0x39, 0, 0)
+            ctypes.windll.user32.keybd_event(0x20, 0x39, 2, 0)
+        QTimer.singleShot(100, self._reset_space_passthrough)
+
+    def _reset_space_passthrough(self):
+        self._space_passthrough = False
 
     def _show_pause_overlay(self):
-        # 截取当前画面 → 缩小 → 高斯模糊 → 放大（大幅提升性能）
-        pix = self.grab()
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            geo = screen.geometry()
+            pix = screen.grabWindow(0)
+        else:
+            geo = self.geometry()
+            pix = QPixmap(geo.size())
+
         scale = 4
         sw, sh = max(1, pix.width() // scale), max(1, pix.height() // scale)
         small = pix.scaled(sw, sh, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
@@ -577,23 +614,21 @@ class FullScreenPlayer(QMainWindow):
         h, w, ch = blurred.shape
         qi = QImage(blurred.data, w, h, w * ch, QImage.Format_RGB888).copy()
         final = QPixmap.fromImage(qi).scaled(
-            self.width(), self.height(),
-            Qt.IgnoreAspectRatio, Qt.SmoothTransformation
+            geo.width(), geo.height(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation
         )
+
         self._pause_bg.setPixmap(final)
-        self._pause_bg.setGeometry(0, 0, self.width(), self.height())
+        self._pause_bg.setGeometry(0, 0, geo.width(), geo.height())
+        self._pause_overlay.setGeometry(geo)
 
-        self._pause_overlay.setGeometry(0, 0, self.width(), self.height())
-
-        cx = (self.width() - 120) // 2
-        cy = (self.height() - 160) // 2
+        cx = (geo.width() - 120) // 2
+        cy = (geo.height() - 160) // 2
         self._spinner_label.move(cx, cy)
-        self._pause_text.setGeometry(0, cy + 130, self.width(), 30)
+        self._pause_text.setGeometry(0, cy + 130, geo.width(), 30)
 
         self._spinner_angle = 0
         self._spinner_timer.start()
         self._pause_overlay.show()
-        self._pause_overlay.raise_()
 
     def _hide_pause_overlay(self):
         self._spinner_timer.stop()
@@ -620,46 +655,78 @@ class FullScreenPlayer(QMainWindow):
         if self._camera_overlay is not None:
             self._camera_overlay.toggle_visibility()
 
+    def _reenable_toggle(self):
+        self._toggle_guard = False
+
+    def _uninstall_hook(self):
+        if self._hooked and hasattr(self, '_hook_id'):
+            ctypes.windll.user32.UnhookWindowsHookEx(self._hook_id)
+            self._hooked = False
+
+    # ========== 全局键盘钩子（Windows） ==========
+    def _install_hook(self):
+        if self._hooked:
+            return
+        self._hooked = True
+        WH_KEYBOARD_LL = 13
+        self._hook_proc = ctypes.WINFUNCTYPE(
+            ctypes.c_long, ctypes.c_int, ctypes.c_ulonglong, ctypes.c_ulonglong
+        )(self._hook_callback)
+        self._hook_id = ctypes.windll.user32.SetWindowsHookExW(
+            WH_KEYBOARD_LL, self._hook_proc, None, 0
+        )
+        # 保持钩子存活
+        self._hook_msg_timer = QTimer(self)
+        self._hook_msg_timer.timeout.connect(lambda: None)
+        self._hook_msg_timer.start(50)
+
+    def _hook_callback(self, nCode, wParam, lParam):
+        if nCode >= 0 and wParam == 0x0100:
+            vk = ctypes.c_ulonglong.from_address(lParam).value & 0xFFFFFFFF
+            if vk == 0x1B:
+                QTimer.singleShot(0, self.close)
+            elif vk == 0x20:
+                if self._space_passthrough:
+                    return ctypes.windll.user32.CallNextHookEx(
+                        self._hook_id, nCode, wParam, lParam
+                    )
+                QTimer.singleShot(0, self._try_toggle)
+                return 1
+            elif vk == 0x43:
+                QTimer.singleShot(0, self._toggle_camera)
+        return ctypes.windll.user32.CallNextHookEx(
+            self._hook_id, nCode, wParam, lParam
+        )
+
+    def _try_toggle(self):
+        if self._toggle_guard:
+            return
+        self._toggle_guard = True
+        self._toggle_pause()
+
+    def _reenable_toggle(self):
+        self._toggle_guard = False
+
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_Escape:
             self.close()
         elif e.key() == Qt.Key_Space:
-            self._toggle_pause()
+            self._try_toggle()
         elif e.key() == Qt.Key_C:
             self._toggle_camera()
         else:
             super().keyPressEvent(e)
 
-    def resizeEvent(self, e):
-        super().resizeEvent(e)
-        if self._pause_overlay.isVisible():
-            self._pause_overlay.setGeometry(0, 0, self.width(), self.height())
-            self._pause_bg.setGeometry(0, 0, self.width(), self.height())
-            cx = (self.width() - 120) // 2
-            cy = (self.height() - 160) // 2
-            self._spinner_label.move(cx, cy)
-            self._pause_text.setGeometry(0, cy + 130, self.width(), 30)
-
     def closeEvent(self, e):
-        if self._video_timer is not None:
-            self._video_timer.stop()
+        self._ffplay.stop()
+        self._uninstall_hook()
         if hasattr(self, '_spinner_timer'):
             self._spinner_timer.stop()
         if self._camera_overlay is not None:
             self._camera_overlay.release()
             self._camera_overlay.close()
-        if self._cap is not None:
-            try:
-                if self._cap.isOpened():
-                    self._cap.release()
-            except Exception:
-                pass
-            self._cap = None
-        if hasattr(self, '_player'):
-            try:
-                self._player.stop()
-            except Exception:
-                pass
+        if hasattr(self, '_pause_overlay'):
+            self._pause_overlay.close()
         if self._on_close is not None:
             self._on_close()
         super().closeEvent(e)
@@ -673,7 +740,13 @@ class MainWindow(QMainWindow):
         self.setWindowTitle('视频连线')
         self.setFixedSize(1680, 1320)
         self._selected_video = None
-        self._setup_ui()
+        try:
+            _log('MainWindow.__init__ 开始 _setup_ui')
+            self._setup_ui()
+            _log('MainWindow.__init__ _setup_ui 完成')
+        except Exception:
+            _log_exc()
+            raise
 
     def _setup_ui(self):
         self.setStyleSheet('QMainWindow { background-color: #f0f2f5; }')
@@ -686,15 +759,14 @@ class MainWindow(QMainWindow):
         wrap.setSpacing(28)
         wrap.setContentsMargins(140, 60, 140, 56)
 
-        # ---------- 标题区 ----------
+        # 标题区
         title_area = QVBoxLayout()
         title_area.setSpacing(10)
 
         title = QLabel('视频连线')
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet(
-            'font-size: 52px; font-weight: 900; color: #1e293b;'
-            'letter-spacing: 12px;'
+            'font-size: 52px; font-weight: 900; color: #1e293b; letter-spacing: 12px;'
         )
         title_area.addWidget(title)
 
@@ -709,8 +781,7 @@ class MainWindow(QMainWindow):
         deauth.setStyleSheet("""
             QPushButton {
                 color: #cbd5e1; font-size: 12px; font-weight: 400;
-                border: none; background: transparent;
-                text-decoration: underline;
+                border: none; background: transparent; text-decoration: underline;
             }
             QPushButton:hover { color: #ef4444; }
         """)
@@ -720,7 +791,7 @@ class MainWindow(QMainWindow):
         wrap.addLayout(title_area)
         wrap.addSpacing(12)
 
-        # ---------- 视频选择区（大） ----------
+        # 视频选择区
         vcard = self._card()
         vl = QVBoxLayout(vcard)
         vl.setContentsMargins(36, 36, 36, 32)
@@ -737,7 +808,6 @@ class MainWindow(QMainWindow):
         """)
         vl.addWidget(self._video_path_label)
 
-        # 按钮行
         br = QHBoxLayout()
         br.setSpacing(20)
         br.addStretch()
@@ -768,12 +838,10 @@ class MainWindow(QMainWindow):
                 font-size: 17px; font-weight: 600;
             }
             QPushButton:hover {
-                background-color: #f1f5f9; color: #334155;
-                border-color: #94a3b8;
+                background-color: #f1f5f9; color: #334155; border-color: #94a3b8;
             }
             QPushButton:disabled {
-                background-color: #f8fafc; color: #cbd5e1;
-                border-color: #e2e8f0;
+                background-color: #f8fafc; color: #cbd5e1; border-color: #e2e8f0;
             }
         """)
         self._clear_btn.clicked.connect(self._clear_video)
@@ -783,21 +851,17 @@ class MainWindow(QMainWindow):
         vl.addLayout(br)
         wrap.addWidget(vcard)
 
-        # ---------- 设置区：摄像头 + 画中画 + 开始 ----------
+        # 设置区
         srow = QHBoxLayout()
         srow.setSpacing(24)
 
-        # 摄像头卡片
         ccard = self._card()
         cl = QVBoxLayout(ccard)
         cl.setContentsMargins(24, 24, 24, 20)
         cl.setSpacing(16)
 
         ctitle = QLabel('选择摄像头')
-        ctitle.setStyleSheet(
-            'color: #334155; font-size: 18px; font-weight: 700;'
-            'padding-bottom: 4px;'
-        )
+        ctitle.setStyleSheet('color: #334155; font-size: 18px; font-weight: 700;')
         cl.addWidget(ctitle)
 
         crow = QHBoxLayout()
@@ -817,26 +881,20 @@ class MainWindow(QMainWindow):
                 border: 1px solid #e2e8f0; border-radius: 10px;
                 font-size: 14px; font-weight: 600;
             }
-            QPushButton:hover {
-                background-color: #e2e8f0; color: #1e293b;
-            }
+            QPushButton:hover { background-color: #e2e8f0; color: #1e293b; }
         """)
         rbtn.clicked.connect(self._detect_cameras)
         crow.addWidget(rbtn)
         cl.addLayout(crow)
         srow.addWidget(ccard, 6)
 
-        # 画中画卡片
         scard = self._card()
         sl = QVBoxLayout(scard)
         sl.setContentsMargins(24, 24, 24, 20)
         sl.setSpacing(16)
 
         stitle = QLabel('画中画大小')
-        stitle.setStyleSheet(
-            'color: #334155; font-size: 18px; font-weight: 700;'
-            'padding-bottom: 4px;'
-        )
+        stitle.setStyleSheet('color: #334155; font-size: 18px; font-weight: 700;')
         sl.addWidget(stitle)
 
         self._size_combo = QComboBox()
@@ -846,20 +904,15 @@ class MainWindow(QMainWindow):
             self._size_combo.addItem(name)
         self._size_combo.setCurrentText(DEFAULT_OVERLAY_SIZE)
         sl.addWidget(self._size_combo)
-
         srow.addWidget(scard, 4)
 
-        # 开始按钮卡片
         btn_card = self._card()
         bl = QVBoxLayout(btn_card)
         bl.setContentsMargins(24, 24, 24, 20)
         bl.setSpacing(16)
 
         btitle = QLabel('开始连线')
-        btitle.setStyleSheet(
-            'color: #334155; font-size: 18px; font-weight: 700;'
-            'padding-bottom: 4px;'
-        )
+        btitle.setStyleSheet('color: #334155; font-size: 18px; font-weight: 700;')
         bl.addWidget(btitle)
 
         self._start_btn = QPushButton('开始连线')
@@ -874,20 +927,16 @@ class MainWindow(QMainWindow):
             }
             QPushButton:hover { background-color: #2563eb; }
             QPushButton:pressed { background-color: #1d4ed8; }
-            QPushButton:disabled {
-                background-color: #e2e8f0; color: #94a3b8;
-            }
+            QPushButton:disabled { background-color: #e2e8f0; color: #94a3b8; }
         """)
         self._start_btn.clicked.connect(self._start_playback)
         bl.addWidget(self._start_btn)
-
         srow.addWidget(btn_card, 3)
 
         wrap.addLayout(srow)
 
         wrap.addStretch()
 
-        # ---------- 底部 ----------
         self._status_label = QLabel('请选择视频文件')
         self._status_label.setAlignment(Qt.AlignCenter)
         self._status_label.setStyleSheet('color: #94a3b8; font-size: 16px;')
@@ -899,17 +948,13 @@ class MainWindow(QMainWindow):
         wrap.addWidget(tips)
 
         self._detect_cameras()
+        _log('_setup_ui 完成')
 
-    # ---------- 控件工厂 ----------
     def _card(self):
         c = QFrame()
         c.setObjectName('card')
         c.setStyleSheet("""
-            #card {
-                background-color: #ffffff;
-                border: 1px solid #e2e8f0;
-                border-radius: 16px;
-            }
+            #card { background-color: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; }
         """)
         return c
 
@@ -926,15 +971,19 @@ class MainWindow(QMainWindow):
                 background-color: #ffffff; color: #334155;
                 border: 1px solid #e2e8f0; border-radius: 8px;
                 selection-background-color: #3b82f6;
-                selection-color: white; outline: none;
-                padding: 6px; font-size: 15px;
+                selection-color: white; outline: none; padding: 6px; font-size: 15px;
             }
         """
 
-    # ---------- 摄像头 ----------
     def _detect_cameras(self):
+        _log('_detect_cameras 开始')
         self._camera_combo.clear()
-        cameras = CameraDetector.get_available_cameras()
+        try:
+            cameras = CameraDetector.get_available_cameras()
+        except Exception:
+            _log_exc()
+            cameras = []
+        _log('_detect_cameras 检测到 {} 个摄像头'.format(len(cameras)))
         if not cameras:
             self._camera_combo.addItem('未检测到摄像头', -1)
             self._status_label.setText('未检测到摄像头，请检查设备连接')
@@ -942,12 +991,10 @@ class MainWindow(QMainWindow):
         else:
             for idx in cameras:
                 self._camera_combo.addItem(CameraDetector.get_camera_label(idx), idx)
-            self._status_label.setText(
-                '已检测到 {} 个可用摄像头'.format(len(cameras))
-            )
+            self._status_label.setText('已检测到 {} 个可用摄像头'.format(len(cameras)))
             self._status_label.setStyleSheet('color: #10b981; font-size: 16px;')
+        _log('_detect_cameras 完成')
 
-    # ---------- 视频 ----------
     def _select_video(self):
         path, _ = QFileDialog.getOpenFileName(
             self, '选择视频文件', '',
@@ -984,7 +1031,6 @@ class MainWindow(QMainWindow):
         self._status_label.setText('请选择视频文件')
         self._status_label.setStyleSheet('color: #94a3b8; font-size: 16px;')
 
-    # ---------- 播放 ----------
     def _start_playback(self):
         if not self._selected_video:
             return
@@ -1019,36 +1065,59 @@ class MainWindow(QMainWindow):
 
 # ==================== 入口 ====================
 def main():
-    # 1. 单实例检查
+    _log('=== 程序启动 ===')
+    _log('sys.frozen={}'.format(getattr(sys, 'frozen', False)))
     if not check_single_instance():
         ctypes.windll.user32.MessageBoxW(
             0, '程序已在运行中，不能同时打开多个实例。', '视频连线', 0x30
         )
         sys.exit(0)
 
-    # 2. Qt 平台插件路径
     if getattr(sys, 'frozen', False):
         base = sys._MEIPASS
+        _log('frozen base={}'.format(base))
         os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = os.path.join(base, 'platforms')
+        os.environ['QT_PLUGIN_PATH'] = base
     else:
         qt_dir = os.path.dirname(PyQt5.__file__)
-        os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = os.path.join(
-            qt_dir, 'Qt5', 'plugins', 'platforms'
-        )
+        plug_dir = os.path.join(qt_dir, 'Qt5', 'plugins')
+        os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = os.path.join(plug_dir, 'platforms')
+        os.environ['QT_PLUGIN_PATH'] = plug_dir
 
-    app = QApplication(sys.argv)
+    _log('创建 QApplication')
+    try:
+        app = QApplication(sys.argv)
+    except Exception:
+        _log_exc()
+        raise
     app.setApplicationName('视频连线')
     app.setStyle('Fusion')
     app.setFont(QFont('Microsoft YaHei', 10))
+    _log('QApplication 创建完毕')
 
-    # 3. 授权验证
     if not verify_license():
+        _log('需要授权验证')
         dlg = AuthDialog()
-        if dlg.exec_() != QDialog.Accepted:
+        result = dlg.exec_()
+        _log('AuthDialog.exec_() 返回 {}'.format(result))
+        if result != QDialog.Accepted:
+            _log('授权验证取消')
             sys.exit(0)
+        _log('授权验证通过')
 
-    window = MainWindow()
+    _log('开始创建 MainWindow')
+    QApplication.processEvents()
+    try:
+        window = MainWindow()
+    except Exception as e:
+        _log_exc()
+        ctypes.windll.user32.MessageBoxW(
+            0, '程序启动失败：{}'.format(str(e)), '错误', 0x10
+        )
+        sys.exit(1)
+    _log('MainWindow 创建完毕, 调用 show()')
     window.show()
+    _log('进入事件循环')
     sys.exit(app.exec_())
 
 
